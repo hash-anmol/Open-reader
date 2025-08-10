@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+output/
+data/cache/
+data/samples/
+*.wav
+*.mp3
+*.ogg
+.DS_Store
