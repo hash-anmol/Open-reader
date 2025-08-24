@@ -160,6 +160,38 @@ tqdm
 - File upload (PDF), voice dropdown (default female), speed slider.
 - Real-time progress bar; tail logs.
 - Start/pause/cancel; output download link to MP3 in `output/test_mp3/`.
+- **Real-time word highlighting**: Words are highlighted in sync with audio playback.
+
+### Word Highlighting Feature
+
+**Goal**: Provide real-time visual feedback by highlighting the currently spoken word during audio playback.
+
+**Implementation Strategy**:
+1. **Backend Timing Generation**: 
+   - Generate word-level timestamps during synthesis using heuristic timing distribution
+   - For each synthesized chunk, calculate duration and distribute across words proportionally
+   - Return timings JSON alongside audio: `[{word, start, end, idx}, ...]`
+
+2. **Frontend Components**:
+   - Add `gr.State()` for storing word timings
+   - Add `gr.HTML()` component for displaying transcript with clickable word spans
+   - Each word wrapped as: `<span class="w" data-start="1.234" data-end="1.567" id="w-123">word</span>`
+
+3. **JavaScript Integration**:
+   - Inject highlighting script that monitors audio `timeupdate` events
+   - Find active word based on `currentTime` and toggle `current` CSS class
+   - Handle seeking, play/pause, and auto-scroll to current word
+
+4. **Styling**:
+   - Highlight current word with background color and border radius
+   - Smooth transitions and readable typography
+   - Auto-scroll to keep current word visible
+
+**Benefits**:
+- Enhanced user experience for audiobook listening
+- Visual feedback for pronunciation and pacing
+- Accessibility support for following along with text
+- Useful for language learning applications
 
 ## Edge Cases & Handling
 
@@ -188,6 +220,97 @@ pip install -r requirements.txt
 5. Wire CLI (`kitten-audiobook`) and test on sample 50-page PDF.
 6. Add Gradio UI leveraging the same pipeline.
 7. Add chapter metadata and M4B (optional).
+
+## Future Features - PDF Audiobook Enhancement
+
+### Feature 1: PDF Upload and Conversion in Gradio Interface
+**Goal**: Add PDF upload functionality to the existing Gradio UI for direct PDF-to-audiobook conversion.
+
+**Implementation Strategy**:
+1. **UI Enhancement**:
+   - Add `gr.File(file_types=[".pdf"])` component to accept PDF uploads
+   - Create new tab or section in Gradio interface dedicated to audiobook generation
+   - Add progress tracking for long-running PDF conversions
+   
+2. **Backend Integration**:
+   - Integrate existing `pdf_reader.py` with the Gradio interface
+   - Leverage current text processing pipeline (cleaning, segmentation, chunking)
+   - Utilize existing TTS engines (KittenTTS/Kokoro) for synthesis
+   
+3. **User Experience**:
+   - Real-time progress indicators for PDF processing stages
+   - Preview of extracted text before synthesis
+   - Downloadable audiobook files (MP3/WAV formats)
+   - Option to pause/resume long conversions
+
+**Benefits**:
+- Seamless PDF-to-audiobook workflow without CLI usage
+- Visual feedback and progress tracking
+- Integration with existing word highlighting features
+
+### Feature 2: Chapter-Based PDF Processing
+**Goal**: Automatically detect and process PDF chapters separately, generating individual audio files per chapter.
+
+**Implementation Strategy**:
+1. **Chapter Detection**:
+   - Analyze PDF bookmarks/outline structure using `pymupdf` outline features
+   - Heuristic-based chapter detection via heading patterns (font size, formatting)
+   - Pattern matching for common chapter indicators ("Chapter 1", "Part I", etc.)
+   
+2. **Chapter-Aware Processing**:
+   - Extend `Document` structure to include chapter boundaries
+   - Modify chunking strategy to respect chapter breaks
+   - Generate separate audio files per detected chapter
+   
+3. **Output Organization**:
+   - Create chapter-based file naming: `book_title_chapter_01.mp3`
+   - Generate chapter manifest/playlist (M3U/JSON format)
+   - Optional: Create combined audiobook with chapter markers (M4B format)
+   
+4. **UI Enhancements**:
+   - Chapter preview with estimated processing times
+   - Individual chapter download options
+   - Chapter-based progress tracking
+
+**Chapter Detection Methods**:
+- **PDF Bookmarks**: Primary method using `doc.get_toc()` for structured PDFs
+- **Heading Analysis**: Secondary method analyzing font sizes, styles, and positioning
+- **Pattern Recognition**: Fallback using regex patterns for chapter indicators
+- **Manual Override**: User-defined chapter break points
+
+**Benefits**:
+- Improved navigation for long audiobooks
+- Efficient processing of large documents
+- Better organization for serial content
+- Enhanced user control over content structure
+
+### Technical Implementation Notes
+
+**Dependencies to Add**:
+- Enhanced PDF outline processing (already available in `pymupdf`)
+- Chapter detection algorithms in `structure.py`
+- Modified UI components in `app.py`
+
+**File Structure Extensions**:
+```
+src/kitten_audiobook/
+├── ingestion/
+│   ├── chapter_detection.py   # Chapter boundary detection
+│   └── pdf_outline.py         # PDF bookmark/outline processing
+├── ui/
+│   ├── pdf_upload.py          # PDF upload handling for Gradio
+│   └── chapter_ui.py          # Chapter-specific UI components
+└── output/
+    └── chapter_assembly.py    # Chapter-based audio file generation
+```
+
+**Configuration Options**:
+- Chapter detection sensitivity settings
+- Output format preferences (individual files vs. combined)
+- Chapter naming conventions
+- Silence duration between chapters
+
+These features build upon the existing robust foundation while adding significant value for audiobook creation workflows.
 
 ## Open Decisions & Defaults (current)
 
