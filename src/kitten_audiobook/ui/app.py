@@ -248,6 +248,21 @@ def tts_generate(text: str, model_choice: str, voice: str, speed: float):
     # Clean model name (remove demo indicators)
     clean_model = model_choice.replace(" (Demo)", "")
     
+    # Smart engine selection based on voice compatibility
+    is_kokoro_voice = voice in KOKORO_VOICES
+    is_kitten_voice = voice in KITTEN_VOICES
+    
+    # Auto-route based on voice if there's a mismatch
+    if clean_model == 'KittenTTS' and is_kokoro_voice:
+        # User selected KittenTTS but chose Kokoro voice - try Kokoro if available
+        if get_kokoro_pipeline():
+            clean_model = 'Kokoro-82M'
+            logging.info(f"Auto-switched to Kokoro for voice: {voice}")
+    elif clean_model == 'Kokoro-82M' and is_kitten_voice:
+        # User selected Kokoro but chose KittenTTS voice - use KittenTTS
+        clean_model = 'KittenTTS'
+        logging.info(f"Auto-switched to KittenTTS for voice: {voice}")
+    
     # Try real TTS synthesis
     if clean_model == 'KittenTTS':
         result = synthesize_kitten_tts(text, voice, speed)
@@ -255,7 +270,12 @@ def tts_generate(text: str, model_choice: str, voice: str, speed: float):
         if audio is not None:
             return (24000, audio), status, timings_json, transcript_html
         else:
-            # Fallback to simple generation
+            # Fallback: Try Kokoro if KittenTTS failed and voice is compatible
+            if is_kokoro_voice and get_kokoro_pipeline():
+                result = synthesize_kokoro_tts(text, voice, speed)
+                audio, status, timings_json, transcript_html = result
+                if audio is not None:
+                    return (24000, audio), f"✅ Fallback to Kokoro: {status}", timings_json, transcript_html
             return ((24000, np.zeros(2400, dtype=np.float32)), 
                     status, 
                     "[]", 
@@ -267,7 +287,12 @@ def tts_generate(text: str, model_choice: str, voice: str, speed: float):
         if audio is not None:
             return (24000, audio), status, timings_json, transcript_html
         else:
-            # Fallback to simple generation
+            # Fallback: Try KittenTTS if Kokoro failed and voice is compatible
+            if is_kitten_voice and get_kitten_engine():
+                result = synthesize_kitten_tts(text, voice, speed)
+                audio, status, timings_json, transcript_html = result
+                if audio is not None:
+                    return (24000, audio), f"✅ Fallback to KittenTTS: {status}", timings_json, transcript_html
             return ((24000, np.zeros(2400, dtype=np.float32)), 
                     status, 
                     "[]", 
@@ -959,21 +984,30 @@ def build_ui():
 
         # Event handlers
         def update_voice_dropdown(model):
+            """Update voice dropdown with smart voice selection"""
             if model == 'KittenTTS':
+                # Show KittenTTS voices but include some popular Kokoro voices with auto-switch notice
+                all_voices = KITTEN_VOICES.copy()
+                if KOKORO_AVAILABLE:
+                    all_voices.extend(['af_heart', 'af_nova', 'am_adam', 'am_echo'])  # Popular Kokoro voices
+                
                 return gr.Dropdown(
-                    choices=KITTEN_VOICES,
+                    choices=all_voices,
                     value='expr-voice-4-f',
                     label="Voice Selection",
-                    info="KittenTTS voices (8 available)",
+                    info="KittenTTS voices + popular Kokoro voices (auto-switches engine)",
                     interactive=True
                 )
             else:  # Kokoro-82M
                 kokoro_choices = sorted(list(KOKORO_VOICES))
+                # Add KittenTTS voices to Kokoro dropdown too
+                all_voices = kokoro_choices + KITTEN_VOICES
+                
                 return gr.Dropdown(
-                    choices=kokoro_choices,
+                    choices=all_voices,
                     value='af_heart',
                     label="Voice Selection", 
-                    info="Kokoro-82M voices (50+ available)",
+                    info="All available voices (auto-switches engine as needed)",
                     interactive=True
                 )
         
@@ -1073,22 +1107,30 @@ def build_ui():
         
         # PDF Tab Event Handlers
         def update_pdf_voice_dropdown(model):
-            """Update PDF voice dropdown based on selected model"""
+            """Update PDF voice dropdown with smart voice selection"""
             if model == 'KittenTTS':
+                # Show KittenTTS voices but include popular Kokoro voices with auto-switch notice  
+                all_voices = KITTEN_VOICES.copy()
+                if KOKORO_AVAILABLE:
+                    all_voices.extend(['af_heart', 'af_nova', 'am_adam', 'am_echo'])
+                    
                 return gr.Dropdown(
-                    choices=KITTEN_VOICES,
+                    choices=all_voices,
                     value='expr-voice-4-f',
                     label="Voice Selection",
-                    info="KittenTTS voices for audiobook",
+                    info="KittenTTS + popular Kokoro voices (auto-switches engine)",
                     interactive=True
                 )
             else:  # Kokoro-82M
                 kokoro_choices = sorted(list(KOKORO_VOICES))
+                # Add KittenTTS voices for fallback
+                all_voices = kokoro_choices + KITTEN_VOICES
+                
                 return gr.Dropdown(
-                    choices=kokoro_choices,
+                    choices=all_voices,
                     value='af_heart',
                     label="Voice Selection", 
-                    info="Kokoro-82M voices for audiobook",
+                    info="All available voices (auto-switches engine as needed)",
                     interactive=True
                 )
         
@@ -1133,17 +1175,36 @@ def build_ui():
                 if not chunks:
                     return None, "❌ Failed to create text chunks", None, gr.update(choices=[], value=None), None
 
-                # Engine selection
+                # Engine selection based on voice and model
                 clean_model = model_choice.replace(" (Demo)", "")
-                if clean_model == 'KittenTTS':
+                
+                # Auto-detect engine based on voice if model doesn't match voice
+                is_kokoro_voice = voice in KOKORO_VOICES
+                is_kitten_voice = voice in KITTEN_VOICES
+                
+                if clean_model == 'Kokoro-82M' or is_kokoro_voice:
+                    # Try to use Kokoro if requested or voice is Kokoro
+                    pipeline = get_kokoro_pipeline()
+                    if pipeline and is_kokoro_voice:
+                        engine = None  # Will use Kokoro pipeline directly
+                        logging.info(f"Using Kokoro pipeline for voice: {voice}")
+                    else:
+                        # Fallback to KittenTTS with compatible voice
+                        engine = get_kitten_engine()
+                        if not engine:
+                            return None, "❌ No TTS engine available", None, gr.update(choices=[], value=None), None
+                        # Switch to compatible KittenTTS voice
+                        voice = 'expr-voice-4-f'
+                        logging.info(f"Kokoro not available, using KittenTTS with voice: {voice}")
+                else:
+                    # Use KittenTTS
                     engine = get_kitten_engine()
                     if not engine:
                         return None, "❌ KittenTTS engine not available", None, gr.update(choices=[], value=None), None
-                else:
-                    # For now chapter UI is wired for KittenTTS path
-                    engine = get_kitten_engine()
-                    if not engine:
-                        return None, "❌ TTS engine not available", None, gr.update(choices=[], value=None), None
+                    # Ensure voice is compatible with KittenTTS
+                    if not is_kitten_voice:
+                        voice = 'expr-voice-4-f'
+                        logging.info(f"Switched to KittenTTS compatible voice: {voice}")
 
                 # Run chapter processor
                 progress(0.15, desc="Detecting chapters...")
@@ -1165,7 +1226,53 @@ def build_ui():
                     frac = base + span * (cur / max(1, total))
                     progress(frac, desc=status)
 
-                result = processor.process_chapters_incrementally(engine, chunks, progress_callback=on_progress)
+                # Handle different engines
+                if engine is None:
+                    # Using Kokoro pipeline - create a wrapper function
+                    def kokoro_synthesis_wrapper(text: str, voice: str = voice, speed: float = speed):
+                        """Wrapper to make Kokoro work like KittenTTS engine"""
+                        pipeline = get_kokoro_pipeline()
+                        if not pipeline:
+                            return np.zeros(int(24000 * 0.5), dtype=np.float32)  # 0.5 sec silence
+                        
+                        try:
+                            segments = pipeline(text, voice=voice, speed=speed)
+                            audio_parts = []
+                            for segment in segments:
+                                if hasattr(segment, 'audio'):
+                                    audio_data = segment.audio
+                                elif isinstance(segment, tuple) and len(segment) >= 3:
+                                    audio_data = segment[2]
+                                else:
+                                    audio_data = segment
+                                    
+                                if audio_data is not None:
+                                    if hasattr(audio_data, 'detach'):
+                                        audio_data = audio_data.detach().cpu().numpy()
+                                    elif hasattr(audio_data, 'numpy'):
+                                        audio_data = audio_data.numpy()
+                                        
+                                    if len(audio_data) > 0:
+                                        audio_parts.append(audio_data.astype(np.float32))
+                            
+                            if audio_parts:
+                                return np.concatenate(audio_parts) if len(audio_parts) > 1 else audio_parts[0]
+                            else:
+                                return np.zeros(int(24000 * 0.5), dtype=np.float32)
+                        except Exception as e:
+                            logging.warning(f"Kokoro synthesis failed: {e}")
+                            return np.zeros(int(24000 * 0.5), dtype=np.float32)
+                    
+                    # Create a mock engine with the synthesis function
+                    class KokoroEngineWrapper:
+                        def synthesize(self, text, voice=voice, speed=speed):
+                            return kokoro_synthesis_wrapper(text, voice, speed)
+                    
+                    mock_engine = KokoroEngineWrapper()
+                    result = processor.process_chapters_incrementally(mock_engine, chunks, progress_callback=on_progress)
+                else:
+                    # Using KittenTTS engine normally
+                    result = processor.process_chapters_incrementally(engine, chunks, progress_callback=on_progress)
 
                 # Build UI outputs
                 final_audio = result.full_audio if result.full_audio is not None else np.zeros(0, dtype=np.float32)
