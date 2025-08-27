@@ -15,7 +15,13 @@ from ..text.cleaning import normalize_text
 from ..text.segmentation import split_into_sentences, Sentence
 from ..text.chunking import build_chunks
 from ..tts.engine import TTSEngine, TTSConfig
-from ..tts.synthesis import synthesize_chunks, assemble_with_pauses, PausePlan
+from ..tts.synthesis import (
+    synthesize_chunks,
+    assemble_with_pauses,
+    PausePlan,
+    compute_chapter_ranges,
+    assemble_chapter_audios,
+)
 from ..audio.assembly import save_wav
 from ..audio.post import loudness_normalize, encode_mp3
 
@@ -151,16 +157,29 @@ def run(pdf_path: Path, voice: str, speed: float, out_dir: Path, max_chars: int,
             if i - 1 >= 0:
                 chapter_breaks[i - 1] = True
 
-    # Assemble
-    audio_full = assemble_with_pauses(audios, chunks, PausePlan(), chapter_breaks=chapter_breaks)
+    # Assemble combined and per-chapter audios
+    pause_plan = PausePlan()
+    audio_full = assemble_with_pauses(audios, chunks, pause_plan, chapter_breaks=chapter_breaks)
+
+    # Compute per-chapter ranges and assemble audios
+    chapter_ranges = compute_chapter_ranges(chapter_breaks, total_chunks=len(chunks))
+    chapter_audios = assemble_chapter_audios(audios, chapter_ranges)
 
     # Loudness normalization
     if normalize_loudness and len(audio_full) > 0:
         audio_full = loudness_normalize(audio_full, 24000, target_lufs=-18.0)
 
-    # Save WAV then encode MP3
+    # Save WAV/MP3 for combined
     save_wav(target.wav_path, audio_full, 24000)
     encode_mp3(target.wav_path, target.mp3_path, bitrate="80k")
+
+    # Save each chapter as base_name.chapterNN.mp3
+    if chapter_audios:
+        for idx, ch_audio in enumerate(chapter_audios, start=1):
+            ch_wav = target.directory / f"{target.base_name}.chapter{idx:02d}.wav"
+            ch_mp3 = target.directory / f"{target.base_name}.chapter{idx:02d}.mp3"
+            save_wav(ch_wav, ch_audio, 24000)
+            encode_mp3(ch_wav, ch_mp3, bitrate="80k")
 
     logging.info("Wrote MP3: %s", target.mp3_path)
     return target.mp3_path

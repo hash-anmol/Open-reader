@@ -9,9 +9,19 @@ import warnings
 try:
     # Try relative imports first (when run as module)
     from ..tts.engine import TTSEngine, TTSConfig
-    from ..tts.synthesis import synthesize_with_backoff, generate_word_timings, word_timings_to_json, create_transcript_html
+    from ..tts.synthesis import (
+        synthesize_with_backoff,
+        generate_word_timings,
+        word_timings_to_json,
+        create_transcript_html,
+        detect_chapter_breaks_from_chunks,
+        compute_chapter_ranges,
+        assemble_chapter_audios,
+    )
     from ..utils.io import ensure_dirs
     from ..ingestion.pdf_reader import read_pdf
+    from ..ingestion.chapter_detection import detect_chapters_enhanced
+    from ..ingestion.chapter_processing import ChapterProcessor
     from ..text.cleaning import normalize_text
     from ..text.segmentation import split_into_sentences
     from ..text.chunking import build_chunks
@@ -24,15 +34,27 @@ except ImportError:
     sys.path.insert(0, str(src_path))
     
     from kitten_audiobook.tts.engine import TTSEngine, TTSConfig
-    from kitten_audiobook.tts.synthesis import synthesize_with_backoff, generate_word_timings, word_timings_to_json, create_transcript_html
+    from kitten_audiobook.tts.synthesis import (
+        synthesize_with_backoff,
+        generate_word_timings,
+        word_timings_to_json,
+        create_transcript_html,
+        detect_chapter_breaks_from_chunks,
+        compute_chapter_ranges,
+        assemble_chapter_audios,
+    )
     from kitten_audiobook.utils.io import ensure_dirs
     from kitten_audiobook.ingestion.pdf_reader import read_pdf
+    from kitten_audiobook.ingestion.chapter_detection import detect_chapters_enhanced
+    from kitten_audiobook.ingestion.chapter_processing import ChapterProcessor
     from kitten_audiobook.text.cleaning import normalize_text
     from kitten_audiobook.text.segmentation import split_into_sentences
     from kitten_audiobook.text.chunking import build_chunks
 from pathlib import Path
 import tempfile
 import os
+import zipfile
+import soundfile as sf
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
@@ -481,9 +503,34 @@ def process_pdf_to_audiobook(pdf_file, model_choice, voice, speed, progress=gr.P
 
 ✅ **Status:** Ready for download"""
         
+        # Build per-chapter audios and package as a zip
+        try:
+            # Use chunk texts for detection
+            chunk_texts = [getattr(ch, 'text', str(ch)) for ch in chunks]
+            chapter_flags = detect_chapter_breaks_from_chunks(chunk_texts)
+            ranges = compute_chapter_ranges(chapter_flags, total_chunks=len(chunks))
+            chapter_audios = assemble_chapter_audios(audio_segments, ranges)
+
+            # Write WAV files to a temp directory and zip them
+            temp_dir = tempfile.mkdtemp(prefix="chapters_")
+            wav_paths = []
+            for idx, ch_audio in enumerate(chapter_audios, start=1):
+                ch_path = os.path.join(temp_dir, f"chapter{idx:02d}.wav")
+                sf.write(ch_path, ch_audio.astype(np.float32), 24000)
+                wav_paths.append(ch_path)
+
+            zip_path = os.path.join(temp_dir, "chapters.zip")
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for p in wav_paths:
+                    zf.write(p, arcname=os.path.basename(p))
+            chapters_zip = zip_path
+        except Exception as _e:
+            logging.warning(f"Failed to create chapters zip: {_e}")
+            chapters_zip = None
+
         progress(1.0, desc="Audiobook complete!")
         
-        return (24000, final_audio), final_info, None
+        return (24000, final_audio), final_info, chapters_zip
         
     except Exception as e:
         logging.error(f"PDF to audiobook error: {e}")
@@ -882,7 +929,30 @@ def build_ui():
                             type="numpy",
                             show_download_button=True
                         )
-                        
+
+                        # Chapter UI: dropdown and single-chapter audio
+                        gr.Markdown("### 📚 Chapters")
+                        with gr.Row():
+                            chapter_dropdown = gr.Dropdown(
+                                label="Select Chapter",
+                                choices=[],
+                                value=None,
+                                interactive=True
+                            )
+                            chapter_audio = gr.Audio(
+                                label="Chapter Audio",
+                                autoplay=False,
+                                type="numpy",
+                                show_download_button=True
+                            )
+
+                        # Chapters zip download
+                        chapters_zip_file = gr.File(
+                            label="Chapters ZIP (per-chapter WAVs)",
+                            file_count="single",
+                            interactive=False
+                        )
+                
                         # Download info
                         with gr.Row():
                             gr.Markdown("**Download:** Once generated, use the download button above to save your audiobook as a WAV file.")
@@ -1035,6 +1105,117 @@ def build_ui():
             except Exception as e:
                 return f"❌ Error extracting text: {str(e)[:100]}", ""
         
+        def update_chapters_zip(chapters_zip):
+            """Update the chapters_zip_file component with the chapters_zip path"""
+            if chapters_zip:
+                return chapters_zip, None
+            return None, "No chapters zip file available"
+
+        def process_pdf_to_audiobook_with_chapters(pdf_file, model_choice, voice, speed, progress=gr.Progress()):
+            """PDF to audiobook with incremental chapter processing and UI wiring"""
+            if pdf_file is None:
+                return None, "❌ No PDF file uploaded", None, gr.update(choices=[], value=None), None
+
+            # Reuse internal function for text + chunks
+            try:
+                progress(0.05, desc="Processing PDF...")
+                info, text, _, _ = process_pdf_to_text(pdf_file)
+                if not text.strip():
+                    return None, "❌ No text extracted from PDF", None, gr.update(choices=[], value=None), None
+
+                # Build chunks
+                progress(0.1, desc="Segmenting text...")
+                paragraphs = text.split('\n\n')
+                sentences = []
+                for i, paragraph in enumerate(paragraphs):
+                    sentences.extend(split_into_sentences(paragraph, i))
+                chunks = build_chunks(sentences, target_chars=280, hard_cap=360)
+                if not chunks:
+                    return None, "❌ Failed to create text chunks", None, gr.update(choices=[], value=None), None
+
+                # Engine selection
+                clean_model = model_choice.replace(" (Demo)", "")
+                if clean_model == 'KittenTTS':
+                    engine = get_kitten_engine()
+                    if not engine:
+                        return None, "❌ KittenTTS engine not available", None, gr.update(choices=[], value=None), None
+                else:
+                    # For now chapter UI is wired for KittenTTS path
+                    engine = get_kitten_engine()
+                    if not engine:
+                        return None, "❌ TTS engine not available", None, gr.update(choices=[], value=None), None
+
+                # Run chapter processor
+                progress(0.15, desc="Detecting chapters...")
+                from pathlib import Path as _Path
+                pdf_path_obj = _Path(pdf_file) if isinstance(pdf_file, str) else None
+                document = read_pdf(pdf_path_obj) if pdf_path_obj else read_pdf(_Path(pdf_file.name))
+                processor = ChapterProcessor(
+                    document=document,
+                    pdf_path=pdf_path_obj or _Path(pdf_file.name),
+                    voice=voice,
+                    speed=speed,
+                    normalize_loudness=True,
+                )
+
+                def on_progress(cur, total, status):
+                    # Map to coarse progress steps
+                    base = 0.2
+                    span = 0.7
+                    frac = base + span * (cur / max(1, total))
+                    progress(frac, desc=status)
+
+                result = processor.process_chapters_incrementally(engine, chunks, progress_callback=on_progress)
+
+                # Build UI outputs
+                final_audio = result.full_audio if result.full_audio is not None else np.zeros(0, dtype=np.float32)
+                choices = [f"{i+1}. {ca.chapter_info.title}" for i, ca in enumerate(result.chapters)]
+                chapters_zip = str(result.zip_path) if result.zip_path else None
+
+                # default first chapter in dropdown
+                value = choices[0] if choices else None
+
+                return (
+                    (24000, final_audio),
+                    "✅ Audiobook created with chapter-by-chapter processing",
+                    chapters_zip,
+                    gr.update(choices=choices, value=value),
+                    None,
+                )
+            except Exception as e:
+                logging.error(f"Chapter processing error: {e}")
+                return None, f"❌ Error: {str(e)[:150]}", None, gr.update(choices=[], value=None), None
+
+        def load_selected_chapter(dropdown_value, pdf_file, model_choice, voice, speed):
+            """Load selected chapter audio into the chapter_audio component."""
+            if not dropdown_value:
+                return None
+            try:
+                # Re-run minimal flow to locate chapter file quickly
+                from pathlib import Path as _Path
+                pdf_path_obj = _Path(pdf_file) if isinstance(pdf_file, str) else _Path(pdf_file.name)
+                document = read_pdf(pdf_path_obj)
+                processor = ChapterProcessor(document=document, pdf_path=pdf_path_obj, voice=voice, speed=speed)
+                # Find index from label prefix "NN. title"
+                idx_str = dropdown_value.split('.', 1)[0]
+                idx = max(1, int(idx_str)) - 1
+                if idx < 0 or idx >= len(processor.chapters_info):
+                    return None
+                # We assume files were written already; try to resolve by sanitized name pattern in output_dir
+                # Fallback: return None silently
+                output_dir = processor.output_dir
+                # Pick matching by index
+                import glob
+                candidates = sorted(glob.glob(str(output_dir / f"chapter_{idx+1:02d}_*.wav")))
+                if not candidates:
+                    return None
+                import soundfile as _sf
+                data, _sr = _sf.read(candidates[0], dtype='float32')
+                return (24000, data.astype(np.float32))
+            except Exception as e:
+                logging.warning(f"Failed to load selected chapter: {e}")
+                return None
+
         # Connect PDF tab events
         pdf_model_choice.change(
             fn=update_pdf_voice_dropdown,
@@ -1049,9 +1230,15 @@ def build_ui():
         )
         
         create_audiobook_btn.click(
-            fn=lambda pdf, model, voice, speed: process_pdf_to_audiobook(pdf, model, voice, speed),
+            fn=process_pdf_to_audiobook_with_chapters,
             inputs=[pdf_file, pdf_model_choice, pdf_voice_dropdown, pdf_speed],
-            outputs=[audiobook_output, pdf_status, gr.State()]
+            outputs=[audiobook_output, pdf_status, chapters_zip_file, chapter_dropdown, chapter_audio]
+        )
+
+        chapter_dropdown.change(
+            fn=load_selected_chapter,
+            inputs=[chapter_dropdown, pdf_file, pdf_model_choice, pdf_voice_dropdown, pdf_speed],
+            outputs=[chapter_audio]
         )
 
     return demo

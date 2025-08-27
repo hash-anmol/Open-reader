@@ -15,4 +15,4 @@ spacy
 gradio
 # misaki>=0.9.4 is required by the wheel, but 0.9.4+ may not be available on all platforms.
 # 0.7.4 works for the current code path (imports only).
-misaki>=0.9.4
+misaki==0.7.4

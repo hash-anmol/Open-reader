@@ -32,3 +32,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+#docs
+natural_tts.md
+claude.md
+SETUP_GUIDE.md

@@ -1,0 +1,14 @@
+numpy
+soundfile
+pymupdf
+regex
+pydub
+pyloudnorm
+tqdm
+huggingface_hub
+onnxruntime
+phonemizer
+espeakng_loader
+num2words
+spacy
+gradio

@@ -5,7 +5,7 @@ import logging
 import re
 import json
 from pathlib import Path
-from typing import Iterable, List, Optional, Dict, Any
+from typing import Iterable, List, Optional, Dict, Any, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -208,6 +208,69 @@ def assemble_with_pauses(
             if n > 0:
                 out_parts.append(np.zeros(n, dtype=np.float32))
     return np.concatenate(out_parts) if out_parts else np.zeros(0, dtype=np.float32)
+
+
+# --- Chapter helpers for per-chapter outputs ---
+def compute_chapter_ranges(chapter_breaks: List[bool], total_chunks: int) -> List[Tuple[int, int]]:
+    """Convert per-chunk break flags into inclusive chapter (start, end) ranges.
+
+    Rules:
+    - A True at index i indicates a break AFTER chunk i.
+    - The final chapter always closes at total_chunks - 1.
+    - Trailing True is ignored (does not create empty chapter).
+    """
+    if total_chunks <= 0:
+        return []
+    ranges: List[Tuple[int, int]] = []
+    start = 0
+    for i in range(total_chunks):
+        # If there is a break after i, close current chapter at i
+        if i < len(chapter_breaks) and chapter_breaks[i]:
+            end = i
+            if end >= start:
+                ranges.append((start, end))
+            start = i + 1
+    # Close the final chapter (even if start == total_chunks this yields empty; guard it)
+    if start <= total_chunks - 1:
+        ranges.append((start, total_chunks - 1))
+    return ranges
+
+
+def assemble_chapter_audios(audios: List[np.ndarray], chapter_ranges: List[Tuple[int, int]]) -> List[np.ndarray]:
+    """Assemble per-chapter audio by concatenating chunk audio for each (start, end) range.
+    Assumes all arrays are mono float32 at 24kHz.
+    """
+    out: List[np.ndarray] = []
+    for start, end in chapter_ranges:
+        if start < 0 or end >= len(audios) or start > end:
+            # Skip invalid range gracefully
+            out.append(np.zeros(0, dtype=np.float32))
+            continue
+        parts = [audios[i].astype('float32') for i in range(start, end + 1)]
+        out.append(np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32))
+    return out
+
+
+def detect_chapter_breaks_from_chunks(chunks_or_texts: List[Chunk | str]) -> List[bool]:
+    """Heuristically detect chapter breaks based on chunk texts.
+
+    Returns a list of flags same length as chunks, where True at i means
+    a chapter break should be inserted AFTER chunk i (i.e., before i+1).
+
+    Heuristic: if a chunk text matches /^chapter\s+\d+\b/i and is short
+    (<= 60 chars) and contains no sentence punctuation, we mark a break
+    before it by setting break at previous index (i-1) to True.
+    """
+    n = len(chunks_or_texts)
+    flags = [False] * n
+    chapter_re = re.compile(r"^chapter\s+\d+\b", re.IGNORECASE)
+    for i in range(n):
+        text = chunks_or_texts[i].text if hasattr(chunks_or_texts[i], 'text') else str(chunks_or_texts[i])
+        t = text.strip()
+        if chapter_re.match(t) and len(t) <= 60 and not any(p in t for p in ['.', '!', '?']):
+            if i - 1 >= 0:
+                flags[i - 1] = True
+    return flags
 
 
 def synthesize_with_backoff(engine: TTSEngine, text: str, voice: str, speed: float) -> tuple[np.ndarray, List[WordTiming]]:
